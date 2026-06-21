@@ -29,10 +29,9 @@ export const userColors = [
 /**
  * Generate a color for a user based on their name
  * @param {string} userName - The user's name
- * @param {number} totalUsers - Total number of users (for fallback)
  * @returns {string} - Hex color code
  */
-export function getUserColor(userName, totalUsers = 0) {
+export function getUserColor(userName) {
   if (!userName) return '#6B7280'; // Gray for system messages
   
   // Create a simple hash from the username

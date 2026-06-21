@@ -1,630 +1,289 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useMemo, useCallback, useRef, useEffect } from 'react';
 import { ZipHandler } from './utils/zipHandler';
-import { parseChat, formatMessageText } from './utils/chatParser';
-import AttachmentViewer from './components/AttachmentViewer';
-import Poll from './components/Poll';
-import { useObjectUrls } from './hooks/useObjectUrls';
+import { parseChat } from './utils/chatParser';
 import { createColorMap } from './utils/colors';
-import { parsePollMessage } from './utils/pollParser';
-import backgroundImage from './assets/bg-dark-BnMQztzI.png';
+import Uploader from './components/Uploader';
+import ChatView from './components/ChatView';
+import AttachmentViewer from './components/AttachmentViewer';
+import StatsPanel from './components/StatsPanel';
+
+const ME_STORAGE_KEY = 'whatsview:me';
 
 /**
- * Main App Component
- * WhatsApp Chat Viewer - Local-only version
+ * Best-effort guess of which participant is the user.
+ * Only attempted for 1:1 chats, where the export filename ("WhatsApp Chat with
+ * <other person>") reliably names the other side — so "you" is the participant
+ * that isn't them. Group chats give no trustworthy signal, so we don't guess.
  */
+function guessMe(senders, chatFileName) {
+  if (senders.length !== 2 || !chatFileName) return '';
+  const other = chatFileName
+    .replace(/\.txt$/i, '')
+    .replace(/^.*chat with\s*/i, '')
+    .trim();
+  // Only trust the guess if the named "other" actually matches a participant.
+  if (!other || !senders.includes(other)) return '';
+  return senders.find((s) => s !== other) || '';
+}
+
+/** Ghost icon button used in the header (renders as <a> when href is given). */
+function HeaderButton({ title, onClick, href, children }) {
+  const cls =
+    'w-9 h-9 flex items-center justify-center rounded-full text-gray-300 hover:text-white hover:bg-white/10 transition-colors shrink-0';
+  return href ? (
+    <a href={href} target="_blank" rel="noopener noreferrer" title={title} className={cls}>
+      {children}
+    </a>
+  ) : (
+    <button onClick={onClick} title={title} className={cls}>
+      {children}
+    </button>
+  );
+}
+
 function App() {
-  const [chatContent, setChatContent] = useState(null);
   const [messages, setMessages] = useState([]);
-  const [isUploading, setIsUploading] = useState(false);
-  const [isProcessing, setIsProcessing] = useState(false);
+  const [chatLoaded, setChatLoaded] = useState(false);
+  const [isBusy, setIsBusy] = useState(false);
   const [error, setError] = useState(null);
   const [zipHandler, setZipHandler] = useState(null);
+
+  const [me, setMe] = useState('');
   const [selectedAttachment, setSelectedAttachment] = useState(null);
-  const [isDragOver, setIsDragOver] = useState(false);
-  const { createObjectUrl, cleanup: cleanupUrls } = useObjectUrls();
+  const [showStats, setShowStats] = useState(false);
 
-  // Create color map for users
-  const participants = useMemo(() => {
-    if (!messages.length) return [];
-    const uniqueSenders = [...new Set(messages.map(m => m.sender).filter(s => s && s !== 'System'))];
-    return uniqueSenders;
-  }, [messages]);
+  const [query, setQuery] = useState('');
+  const [activeMatch, setActiveMatch] = useState(0);
+  const chatViewRef = useRef(null);
 
+  const participants = useMemo(
+    () => [...new Set(messages.map((m) => m.sender).filter((s) => s && s !== 'System'))],
+    [messages]
+  );
   const colorMap = useMemo(() => createColorMap(participants), [participants]);
 
-  // Handle file upload
-  const handleFileUpload = async (event) => {
-    const file = event.target.files[0];
-    if (!file) return;
+  // Search matches (indices into messages).
+  const matches = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return [];
+    const result = [];
+    messages.forEach((m, i) => {
+      if (m.message.toLowerCase().includes(q) || m.sender.toLowerCase().includes(q)) {
+        result.push(i);
+      }
+    });
+    return result;
+  }, [query, messages]);
 
+  useEffect(() => {
+    setActiveMatch(0);
+    if (matches.length > 0) chatViewRef.current?.scrollToIndex(matches[0]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [query]);
+
+  const goToMatch = useCallback(
+    (dir) => {
+      if (matches.length === 0) return;
+      const next = (activeMatch + dir + matches.length) % matches.length;
+      setActiveMatch(next);
+      chatViewRef.current?.scrollToIndex(matches[next]);
+    },
+    [activeMatch, matches]
+  );
+
+  const getBlob = useCallback(
+    (filename, mimeType) =>
+      zipHandler ? zipHandler.getBlob(filename, mimeType) : Promise.resolve(null),
+    [zipHandler]
+  );
+
+  const handleFile = async (file) => {
     if (!file.name.toLowerCase().endsWith('.zip')) {
-      setError('Please upload a ZIP file');
+      setError('Please upload a ZIP file.');
       return;
     }
-
-    setIsUploading(true);
-    setIsProcessing(false);
+    setIsBusy(true);
     setError(null);
-
     try {
-      // Create ZIP handler and process file
       const handler = new ZipHandler();
-      const result = await handler.loadZipFile(file);
-      
-      setIsUploading(false);
-      setIsProcessing(true);
+      const { chatText, fileNames, chatFileName } = await handler.loadZipFile(file);
+      const parsed = parseChat(chatText, fileNames);
+      if (parsed.length === 0) {
+        throw new Error('No messages could be read from this chat export.');
+      }
 
-      // Read chat file content
-      const chatText = await result.chatFile.blob.text();
-      
-      // Parse messages
-      const parsedMessages = parseChat(chatText, result.files);
-      
-      setChatContent(chatText);
-      setMessages(parsedMessages);
+      const senders = [...new Set(parsed.map((m) => m.sender).filter((s) => s && s !== 'System'))];
+      const savedMe = localStorage.getItem(ME_STORAGE_KEY);
+
+      setMessages(parsed);
       setZipHandler(handler);
-      setIsProcessing(false);
-
+      // Prefer a previously chosen name; otherwise guess for 1:1 chats only.
+      setMe(senders.includes(savedMe) ? savedMe : guessMe(senders, chatFileName));
+      setChatLoaded(true);
     } catch (err) {
       setError(err.message);
-      setIsUploading(false);
-      setIsProcessing(false);
+    } finally {
+      setIsBusy(false);
     }
   };
 
-  // Get system message icon
-  const getSystemMessageIcon = (systemType) => {
-    switch (systemType) {
-      case 'joined':
-        return '➕';
-      case 'left':
-        return '➖';
-      case 'created':
-        return '👥';
-      case 'name_changed':
-        return '✏️';
-      case 'description_changed':
-        return '📝';
-      case 'icon_changed':
-        return '🖼️';
-      case 'encryption':
-        return '🔒';
-      case 'ended':
-        return '🗑️';
-      default:
-        return 'ℹ️';
-    }
+  const handleSelectMe = (value) => {
+    setMe(value);
+    if (value) localStorage.setItem(ME_STORAGE_KEY, value);
   };
 
-  // Reset state
   const handleReset = () => {
-    setChatContent(null);
+    zipHandler?.cleanup();
     setMessages([]);
-    setError(null);
-    setIsUploading(false);
-    setIsProcessing(false);
+    setChatLoaded(false);
+    setZipHandler(null);
     setSelectedAttachment(null);
-    cleanupUrls(); // Clean up object URLs
-    if (zipHandler) {
-      zipHandler.cleanup();
-      setZipHandler(null);
-    }
-  };
-
-  // Drag and drop handlers
-  const handleDragOver = (e) => {
-    e.preventDefault();
-    setIsDragOver(true);
-  };
-
-  const handleDragLeave = (e) => {
-    e.preventDefault();
-    setIsDragOver(false);
-  };
-
-  const handleDrop = (e) => {
-    e.preventDefault();
-    setIsDragOver(false);
-    
-    const files = e.dataTransfer.files;
-    if (files.length > 0) {
-      const file = files[0];
-      if (file.type === 'application/zip' || file.name.toLowerCase().endsWith('.zip')) {
-        handleFileUpload({ target: { files: [file] } });
-      } else {
-        setError('Please select a valid ZIP file.');
-      }
-    }
+    setShowStats(false);
+    setQuery('');
+    setError(null);
   };
 
   return (
-    <div className="flex h-screen w-screen bg-whatsapp-dark text-white">
-      {/* Main Container */}
-      <div className="w-full h-full flex flex-col overflow-hidden">
-        {/* Header */}
-               <header className="p-4 bg-whatsapp-header text-gray-300 font-semibold text-lg border-b border-gray-700">
-                 <div className="flex items-center justify-between">
-                   <h1>WhatsApp Chat Viewer</h1>
-                   <div className="flex items-center space-x-4">
-                     {chatContent && (
-                       <div className="text-sm text-gray-400">
-                         {messages.length} messages loaded
-                       </div>
-                     )}
-                     <a
-                       href="https://github.com/prxnav/whatsview"
-                       target="_blank"
-                       rel="noopener noreferrer"
-                       className="flex items-center space-x-2 text-gray-400 hover:text-white transition-colors"
-                       title="View source code on GitHub"
-                     >
-                       <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
-                         <path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/>
-                       </svg>
-                       <span className="text-sm">Source</span>
-                     </a>
-                   </div>
-                 </div>
-        </header>
-
-        {/* Main Content */}
-        <main className="flex-1 overflow-y-auto">
-          {/* Show upload interface if no chat loaded */}
-          {!chatContent ? (
-            <div className="flex-1 flex items-center justify-center p-6 bg-whatsapp-dark" style={{
-              backgroundImage: `url("${backgroundImage}")`,
-              backgroundRepeat: 'repeat',
-              backgroundSize: 'auto'
-            }}>
-              <div className="w-full max-w-4xl">
-                {/* Error Display */}
-                {error && (
-                  <div className="mb-6 bg-red-900/20 border border-red-800 rounded-lg p-4">
-                    <div className="flex items-center space-x-3">
-                      <div className="text-red-400">⚠️</div>
-                      <div>
-                        <h3 className="text-sm font-medium text-red-200">Upload Error</h3>
-                        <p className="mt-1 text-sm text-red-300">{error}</p>
-                      </div>
-                      <button
-                        onClick={() => setError(null)}
-                        className="ml-auto text-red-400 hover:text-red-300"
-                      >
-                        ✕
-                      </button>
-                    </div>
-                  </div>
-                )}
-
-                {/* WhatsApp-themed Upload Component */}
-                <div 
-                  className={`bg-whatsapp-gray rounded-2xl p-8 shadow-2xl border-2 border-dashed max-w-2xl mx-auto transition-all duration-200 ${
-                    isDragOver 
-                      ? 'border-whatsapp-green bg-green-900 bg-opacity-20' 
-                      : 'border-gray-700'
-                  }`}
-                  onDragOver={handleDragOver}
-                  onDragLeave={handleDragLeave}
-                  onDrop={handleDrop}
-                >
-                  <div className="text-center">
-
-                    {/* Upload Icon */}
-                    <div className="mx-auto w-16 h-16 bg-whatsapp-green rounded-full flex items-center justify-center mb-6 shadow-lg">
-                      <svg className="w-8 h-8 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
-                      </svg>
-                    </div>
-
-                    {/* Title */}
-                    <h3 className="text-2xl font-bold text-white mb-3">
-                      {isUploading ? 'Processing Your Chat...' : 'Upload WhatsApp Chat'}
-                    </h3>
-                    <p className="text-whatsapp-meta text-lg mb-8">
-                      {isUploading 
-                        ? 'Please wait while we process your messages'
-                        : isDragOver
-                        ? 'Drop your ZIP file here'
-                        : 'Drag & drop your ZIP file here or click to browse'
-                      }
-                    </p>
-
-                    {/* File Input */}
-                    <input
-                      type="file"
-                      accept=".zip"
-                      onChange={handleFileUpload}
-                      className="hidden"
-                      id="file-upload"
-                      disabled={isUploading}
-                    />
-                    <label
-                      htmlFor="file-upload"
-                      className={`inline-flex items-center px-8 py-4 bg-whatsapp-green text-white rounded-xl font-semibold cursor-pointer hover:bg-green-600 transition-all duration-200 shadow-lg hover:shadow-xl transform hover:scale-105 ${
-                        isUploading ? 'opacity-50 cursor-not-allowed' : ''
-                      }`}
-                    >
-                      {isUploading ? (
-                        <>
-                          <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-white mr-3"></div>
-                          Processing...
-                        </>
-                      ) : (
-                        <>
-                          <svg className="w-5 h-5 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
-                          </svg>
-                          Choose ZIP File
-                        </>
-                      )}
-                    </label>
-
-                    {/* Privacy Notice */}
-                    <div className="mt-8 p-4 bg-whatsapp-dark bg-opacity-50 rounded-xl border border-gray-600">
-                      <div className="flex items-start space-x-3">
-                        <div className="flex-shrink-0">
-                          <svg className="w-5 h-5 text-whatsapp-green mt-0.5" fill="currentColor" viewBox="0 0 20 20">
-                            <path fillRule="evenodd" d="M5 9V7a5 5 0 0110 0v2a2 2 0 012 2v5a2 2 0 01-2 2H5a2 2 0 01-2-2v-5a2 2 0 012-2zm8-2v2H7V7a3 3 0 016 0z" clipRule="evenodd" />
-                          </svg>
-                        </div>
-                        <div className="text-left">
-                          <p className="text-whatsapp-meta text-sm font-medium mb-1">100% Local & Privacy-First</p>
-                          <p className="text-whatsapp-meta text-xs">
-                            Your data never leaves your device. No server uploads, no data collection, no tracking.
-                          </p>
-                        </div>
-                      </div>
-                    </div>
-
-                  </div>
-                </div>
-
-                {/* Source Code Section */}
-                <div className="mt-12 max-w-2xl mx-auto">
-                  <div className="bg-gray-900 bg-opacity-60 rounded-2xl p-6 border border-gray-700">
-                    <div className="text-center">
-                      {/* Section Header */}
-                      <div className="mb-6">
-                        <h3 className="text-lg font-semibold text-white mb-2">Open Source & Transparent</h3>
-                        <p className="text-gray-400 text-sm">
-                          View source code, audit the code, or run it locally. Complete transparency and control.
-                        </p>
-                      </div>
-                      
-                      {/* GitHub Button */}
-                      <a
-                        href="https://github.com/pranavkale07/whatsview"
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="inline-flex items-center space-x-2 px-6 py-3 bg-gray-800 text-gray-200 rounded-lg font-medium hover:bg-gray-700 hover:text-white transition-all duration-200 border border-gray-600 hover:border-gray-500 shadow-md hover:shadow-lg transform hover:scale-105"
-                      >
-                        <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
-                          <path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/>
-                        </svg>
-                        <span>View Source Code</span>
-                      </a>
-                      
-                      {/* Additional Info */}
-                      <div className="mt-4 flex items-center justify-center space-x-6 text-xs text-gray-500">
-                        <span className="flex items-center space-x-1">
-                          <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
-                            <path fillRule="evenodd" d="M5 9V7a5 5 0 0110 0v2a2 2 0 012 2v5a2 2 0 01-2 2H5a2 2 0 01-2-2v-5a2 2 0 012-2zm8-2v2H7V7a3 3 0 016 0z" clipRule="evenodd" />
-                          </svg>
-                          <span>100% Local</span>
-                        </span>
-                        <span className="flex items-center space-x-1">
-                          <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
-                            <path fillRule="evenodd" d="M12.316 3.051a1 1 0 01.633 1.265l-4 12a1 1 0 11-1.898-.632l4-12a1 1 0 011.265-.633zM5.707 6.293a1 1 0 010 1.414L3.414 10l2.293 2.293a1 1 0 11-1.414 1.414l-3-3a1 1 0 010-1.414l3-3a1 1 0 011.414 0zm8.586 0a1 1 0 011.414 0l3 3a1 1 0 010 1.414l-3 3a1 1 0 11-1.414-1.414L16.586 10l-2.293-2.293a1 1 0 010-1.414z" clipRule="evenodd" />
-                          </svg>
-                          <span>Open Source</span>
-                        </span>
-                        <span className="flex items-center space-x-1">
-                          <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
-                            <path fillRule="evenodd" d="M3 4a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zm0 4a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zm0 4a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zm0 4a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1z" clipRule="evenodd" />
-                          </svg>
-                          <span>MIT License</span>
-                        </span>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-
-              </div>
-            </div>
-          ) : (
-            /* Show chat interface */
-                   <div className="w-full h-full overflow-y-auto bg-whatsapp-dark" style={{
-                     backgroundImage: `url("${backgroundImage}")`,
-                     backgroundRepeat: 'repeat',
-                     backgroundSize: 'auto'
-                   }}>
-              {isProcessing ? (
-                <div className="flex items-center justify-center h-full">
-                  <div className="text-center space-y-4">
-                    <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500 mx-auto"></div>
-                    <p className="text-gray-400">Processing chat messages...</p>
-                  </div>
-                </div>
-              ) : messages.length > 0 ? (
-                <div className="space-y-1 px-4 py-4">
-                         {messages.map((message, index) => {
-                           const isOwnMessage = message.sender === 'You';
-                           const isSystemMessage = message.type === 'system';
-                           const showDateSeparator = index === 0 || 
-                             messages[index - 1].date !== message.date;
-                           
-                           // Check if this message is from the same sender as the previous one
-                           const prevMessage = messages[index - 1];
-                           const sameSenderAsPrevious = prevMessage && 
-                             prevMessage.sender === message.sender && 
-                             prevMessage.date === message.date &&
-                             !isSystemMessage && 
-                             prevMessage.type !== 'system' &&
-                             prevMessage.sender !== 'System';
-                           
-                           // Get user color
-                           const userColor = colorMap[message.sender] || '#6B7280';
-                           
-                           // Check if this is a poll message
-                           const pollData = parsePollMessage(message.message);
-                           
-                           // Debug logging for grouping
-                           if (index < 10) {
-                             console.log(`Message ${index}:`, {
-                               sender: message.sender,
-                               prevSender: prevMessage?.sender,
-                               sameSenderAsPrevious,
-                               isOwnMessage,
-                               isSystemMessage,
-                               message: message.message.substring(0, 20) + '...',
-                               cssClass: sameSenderAsPrevious ? 'mt-0' : 'mt-3'
-                             });
-                           }
-
-
-                    return (
-                      <div key={message.id || index} className="flex flex-col items-center">
-                        {/* Date Separator */}
-                        {showDateSeparator && (
-                          <div className="flex justify-center my-4">
-                            <div className="text-gray-400 text-xs px-3 py-1 bg-whatsapp-header rounded-full">
-                              {message.date}
-                            </div>
-                          </div>
-                        )}
-
-                               {/* System Message */}
-                               {isSystemMessage ? (
-                                 <div className="flex justify-center my-1">
-                                   <div className="text-yellow-200 text-xs px-2 py-1 bg-yellow-900 bg-opacity-30 rounded-full inline-block">
-                                     {message.message}
-                                   </div>
-                                 </div>
-                               ) : (
-                                 /* Regular Message Bubble */
-                                 <div className={`flex w-full ${isOwnMessage ? 'justify-end' : 'justify-start'} ${sameSenderAsPrevious ? 'mt-0' : 'mt-3'}`}>
-                                 <div
-                                   className={`max-w-[70%] px-3 py-2 rounded-lg ${
-                                     isOwnMessage
-                                       ? 'bg-whatsapp-green text-white rounded-br-sm' // WhatsApp green with tail
-                                       : 'bg-whatsapp-gray text-gray-200 rounded-bl-sm' // WhatsApp gray with tail
-                                   } ${sameSenderAsPrevious ? 'rounded-tl-sm rounded-tr-sm' : ''}`}
-                                   style={{ 
-                                     whiteSpace: 'pre-wrap',
-                                     wordWrap: 'break-word',
-                                     overflowWrap: 'break-word'
-                                   }}
-                                 >
-                                   {/* Sender Name - only show for group chats and when not same sender as previous */}
-                                   {!isOwnMessage && !sameSenderAsPrevious && (
-                                     <p 
-                                       className="text-xs font-semibold mb-1" 
-                                       style={{ color: userColor }}
-                                     >
-                                       {message.sender}
-                                     </p>
-                                   )}
-
-                                   {/* Message Content - only show if no attachment or if attachment is not image/video */}
-                                   {message.message.includes('<Media omitted>') ? (
-                                     /* Media omitted placeholder */
-                                     <div className="flex items-center space-x-2 p-3 bg-gray-700 rounded-lg border border-gray-600">
-                                       <div className="flex-1">
-                                         <p className="text-sm font-medium text-gray-300">Media omitted</p>
-                                         <p className="text-xs text-gray-400">This media was not included in the export</p>
-                                       </div>
-                                     </div>
-                                   ) : pollData ? (
-                                     /* Poll content */
-                                     <Poll pollData={pollData} />
-                                   ) : !message.attachment || (message.attachment && message.attachment.type !== 'image' && message.attachment.type !== 'video') ? (
-                                     /* Regular message content with inline timestamp */
-                                     <div className="flex items-end justify-end">
-                                       <div className="flex-1">
-                                         <p 
-                                           className="text-sm leading-relaxed"
-                                           dangerouslySetInnerHTML={{
-                                             __html: formatMessageText(message.message)
-                                           }}
-                                         />
-                                       </div>
-                                       <span className={`text-xs ml-2 opacity-70 ${
-                                         isOwnMessage ? 'text-green-100' : 'text-gray-400'
-                                       }`}>
-                                         {message.time}
-                                       </span>
-                                     </div>
-                                   ) : null}
-
-                            {/* Attachment - show first for images and videos */}
-                            {message.attachment && (
-                              <div className="mt-2">
-                                {message.attachment.type === 'image' ? (
-                                  /* Inline Image Display */
-                                  <div 
-                                    className="cursor-pointer rounded-lg overflow-hidden max-w-xs relative"
-                                    onClick={() => setSelectedAttachment(message.attachment)}
-                                  >
-                                    <img
-                                      src={createObjectUrl(message.attachment.blob)}
-                                      alt={message.attachment.filename}
-                                      className="w-full h-auto rounded-lg hover:opacity-90 transition-opacity"
-                                      onError={(e) => {
-                                        e.target.style.display = 'none';
-                                        e.target.nextSibling.style.display = 'block';
-                                      }}
-                                    />
-                                    
-                                    {/* Timestamp overlay for images - only if no text message */}
-                                    {!message.message.trim() && (
-                                      <div className={`absolute bottom-2 right-2 px-2 py-1 rounded text-xs opacity-80 ${
-                                        isOwnMessage ? 'bg-black bg-opacity-50 text-green-100' : 'bg-black bg-opacity-50 text-gray-300'
-                                      }`}>
-                                        {message.time}
-                                      </div>
-                                    )}
-                                    
-                                    <div 
-                                      className="hidden p-2 bg-black bg-opacity-20 rounded cursor-pointer hover:bg-opacity-30 transition-colors"
-                                      onClick={() => setSelectedAttachment(message.attachment)}
-                                    >
-                                      <div className="flex items-center space-x-2">
-                                        <span className="text-lg">🖼️</span>
-                                        <div className="flex-1 min-w-0">
-                                          <p className="text-sm font-medium truncate">{message.attachment.filename}</p>
-                                          <p className="text-xs text-gray-400">Click to view</p>
-                                        </div>
-                                      </div>
-                                    </div>
-                                  </div>
-                                ) : message.attachment.type === 'video' ? (
-                                  /* Inline Video Thumbnail Display */
-                                  <div 
-                                    className="cursor-pointer rounded-lg overflow-hidden max-w-xs relative group"
-                                    onClick={() => setSelectedAttachment(message.attachment)}
-                                  >
-                                    <video
-                                      src={createObjectUrl(message.attachment.blob)}
-                                      className="w-full h-auto rounded-lg"
-                                      preload="metadata"
-                                      onLoadedMetadata={(e) => {
-                                        // Set the video to show the first frame as thumbnail
-                                        e.target.currentTime = 1;
-                                      }}
-                                      onError={(e) => {
-                                        e.target.style.display = 'none';
-                                        e.target.nextSibling.style.display = 'block';
-                                      }}
-                                    />
-                                    
-                                    {/* Play Icon Overlay */}
-                                    <div className="absolute inset-0 flex items-center justify-center bg-black bg-opacity-30 group-hover:bg-opacity-40 transition-all">
-                                      <div className="w-12 h-12 bg-white bg-opacity-90 rounded-full flex items-center justify-center shadow-lg">
-                                        <svg className="w-6 h-6 text-gray-800 ml-1" fill="currentColor" viewBox="0 0 24 24">
-                                          <path d="M8 5v14l11-7z"/>
-                                        </svg>
-                                      </div>
-                                    </div>
-                                    
-                                    {/* Timestamp overlay for videos - only if no text message */}
-                                    {!message.message.trim() && (
-                                      <div className={`absolute bottom-2 right-2 px-2 py-1 rounded text-xs opacity-80 ${
-                                        isOwnMessage ? 'bg-black bg-opacity-50 text-green-100' : 'bg-black bg-opacity-50 text-gray-300'
-                                      }`}>
-                                        {message.time}
-                                      </div>
-                                    )}
-                                    
-                                    {/* Fallback for video load error */}
-                                    <div 
-                                      className="hidden p-2 bg-black bg-opacity-20 rounded cursor-pointer hover:bg-opacity-30 transition-colors"
-                                      onClick={() => setSelectedAttachment(message.attachment)}
-                                    >
-                                      <div className="flex items-center space-x-2">
-                                        <span className="text-lg">🎥</span>
-                                        <div className="flex-1 min-w-0">
-                                          <p className="text-sm font-medium truncate">{message.attachment.filename}</p>
-                                          <p className="text-xs text-gray-400">Click to view</p>
-                                        </div>
-                                      </div>
-                                    </div>
-                                  </div>
-                                ) : (
-                                  /* Other attachment types - clickable reference */
-                                  <div 
-                                    className="p-2 bg-black bg-opacity-20 rounded cursor-pointer hover:bg-opacity-30 transition-colors"
-                                    onClick={() => setSelectedAttachment(message.attachment)}
-                                  >
-                                    <div className="flex items-center space-x-2">
-                                      <span className="text-lg">
-                                        {message.attachment.type === 'video' ? '🎥' :
-                                         message.attachment.type === 'audio' ? '🎵' :
-                                         message.attachment.type === 'document' ? '📄' : '📎'}
-                                      </span>
-                                      <div className="flex-1 min-w-0">
-                                        <p className="text-sm font-medium truncate">{message.attachment.filename}</p>
-                                        <p className="text-xs text-gray-400 capitalize">{message.attachment.type}</p>
-                                      </div>
-                                      <span className="text-xs text-gray-500">Click to view</span>
-                                    </div>
-                                  </div>
-                                )}
-                              </div>
-                            )}
-
-                            {/* Text content after image/video - only for messages with image/video attachments */}
-                            {message.attachment && (message.attachment.type === 'image' || message.attachment.type === 'video') && message.message.trim() && (
-                              <div className="mt-2 max-w-xs">
-                                <div className="flex items-end justify-end">
-                                  <div className="flex-1">
-                                    <p 
-                                      className="text-sm leading-relaxed"
-                                      dangerouslySetInnerHTML={{
-                                        __html: formatMessageText(message.message)
-                                      }}
-                                    />
-                                  </div>
-                                  <span className={`text-xs ml-2 opacity-70 ${
-                                    isOwnMessage ? 'text-green-100' : 'text-gray-400'
-                                  }`}>
-                                    {message.time}
-                                  </span>
-                                </div>
-                              </div>
-                            )}
-                          </div>
-                        </div>
-                        )}
-              </div>
-            );
-          })}
+    <div className="flex flex-col h-screen w-screen bg-whatsapp-dark text-white">
+      <header className="h-14 px-3 sm:px-4 bg-whatsapp-header border-b border-black/30 flex items-center gap-3 shrink-0">
+        {/* Brand */}
+        <div className="flex items-center gap-2.5 min-w-0">
+          <div className="w-9 h-9 rounded-full bg-whatsapp-green flex items-center justify-center shrink-0">
+            <svg className="w-5 h-5 text-white" fill="currentColor" viewBox="0 0 24 24">
+              <path d="M2.25 12.76c0 1.6 1.123 2.994 2.707 3.227 1.087.16 2.185.283 3.293.369V21l4.184-4.183a1.14 1.14 0 01.778-.332 48.294 48.294 0 005.83-.498c1.585-.233 2.708-1.626 2.708-3.228V6.741c0-1.602-1.123-2.995-2.707-3.228A48.394 48.394 0 0012 3c-2.392 0-4.744.175-7.043.513C3.373 3.746 2.25 5.14 2.25 6.741v6.018z" />
+            </svg>
+          </div>
+          <div className="leading-tight min-w-0">
+            <h1 className="font-semibold text-white text-[15px]">WhatsView</h1>
+            <p className="text-[11px] text-gray-400 truncate">
+              {chatLoaded
+                ? `${messages.length.toLocaleString()} messages · ${participants.length} ${
+                    participants.length === 1 ? 'person' : 'people'
+                  }`
+                : 'Local chat viewer'}
+            </p>
+          </div>
         </div>
-              ) : (
-                <div className="flex items-center justify-center h-full">
-                  <div className="text-center space-y-4">
-                    <div className="text-gray-400 text-6xl">💬</div>
-                    <h3 className="text-2xl font-semibold text-white">
-                      No Messages Found
-                    </h3>
-                    <p className="text-gray-400">
-                      No messages were found in the chat file.
-                    </p>
-                  </div>
+
+        {chatLoaded && (
+          <>
+            {/* Search */}
+            <div className="flex items-center gap-2 bg-whatsapp-dark rounded-lg h-9 px-3 ml-1 flex-1 max-w-sm min-w-[9rem] focus-within:ring-1 focus-within:ring-whatsapp-green">
+              <svg className="w-4 h-4 text-gray-500 shrink-0" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-5.197-5.197m0 0A7.5 7.5 0 105.196 5.196a7.5 7.5 0 0010.607 10.607z" />
+              </svg>
+              <input
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && goToMatch(e.shiftKey ? -1 : 1)}
+                placeholder="Search messages"
+                className="bg-transparent text-sm text-gray-200 flex-1 outline-none placeholder-gray-500 min-w-0"
+              />
+              {query && (
+                <div className="flex items-center gap-0.5 shrink-0">
+                  <span className="text-xs text-gray-400 tabular-nums mr-1">
+                    {matches.length ? `${activeMatch + 1}/${matches.length}` : '0'}
+                  </span>
+                  <button onClick={() => goToMatch(-1)} title="Previous (Shift+Enter)" className="p-0.5 text-gray-400 hover:text-white disabled:opacity-30" disabled={!matches.length}>
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 15.75l7.5-7.5 7.5 7.5" />
+                    </svg>
+                  </button>
+                  <button onClick={() => goToMatch(1)} title="Next (Enter)" className="p-0.5 text-gray-400 hover:text-white disabled:opacity-30" disabled={!matches.length}>
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 8.25l-7.5 7.5-7.5-7.5" />
+                    </svg>
+                  </button>
                 </div>
               )}
             </div>
-          )}
-        </main>
 
-      </div>
+            <div className="ml-auto flex items-center gap-1 shrink-0">
+              {/* Who am I */}
+              <label
+                className="hidden sm:flex items-center gap-1.5 h-9 pl-2.5 pr-2 rounded-lg bg-whatsapp-dark hover:bg-white/5 cursor-pointer"
+                title="Whose messages should appear as yours"
+              >
+                <svg className="w-4 h-4 text-gray-400 shrink-0" fill="currentColor" viewBox="0 0 24 24">
+                  <path d="M12 12a5 5 0 100-10 5 5 0 000 10zm0 2c-4.418 0-8 2.239-8 5v1h16v-1c0-2.761-3.582-5-8-5z" />
+                </svg>
+                <select
+                  value={me}
+                  onChange={(e) => handleSelectMe(e.target.value)}
+                  className="appearance-none bg-transparent text-sm text-gray-200 outline-none cursor-pointer max-w-[9rem] pr-4"
+                  style={{
+                    backgroundImage:
+                      "url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' fill='none' stroke='%239ca3af' stroke-width='2' viewBox='0 0 24 24'%3E%3Cpath stroke-linecap='round' stroke-linejoin='round' d='M19.5 8.25l-7.5 7.5-7.5-7.5'/%3E%3C/svg%3E\")",
+                    backgroundRepeat: 'no-repeat',
+                    backgroundPosition: 'right center',
+                    backgroundSize: '0.9rem',
+                  }}
+                >
+                  <option value="">Set “you”…</option>
+                  {participants.map((p) => (
+                    <option key={p} value={p}>
+                      {p}
+                    </option>
+                  ))}
+                </select>
+              </label>
 
-      {/* Attachment Viewer Modal */}
+              <HeaderButton title="Chat statistics" onClick={() => setShowStats(true)}>
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M3 13.125C3 12.504 3.504 12 4.125 12h2.25c.621 0 1.125.504 1.125 1.125v6.75C7.5 20.496 6.996 21 6.375 21h-2.25A1.125 1.125 0 013 19.875v-6.75zM9.75 8.625c0-.621.504-1.125 1.125-1.125h2.25c.621 0 1.125.504 1.125 1.125v11.25c0 .621-.504 1.125-1.125 1.125h-2.25a1.125 1.125 0 01-1.125-1.125V8.625zM16.5 4.125c0-.621.504-1.125 1.125-1.125h2.25C20.496 3 21 3.504 21 4.125v15.75c0 .621-.504 1.125-1.125 1.125h-2.25a1.125 1.125 0 01-1.125-1.125V4.125z" />
+                </svg>
+              </HeaderButton>
+
+              <HeaderButton title="Open another chat" onClick={handleReset}>
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 7.5L12 3m0 0L7.5 7.5M12 3v13.5" />
+                </svg>
+              </HeaderButton>
+
+              <span className="w-px h-5 bg-white/10 mx-1" />
+              <HeaderButton title="Source code" href="https://github.com/pranavkale07/whatsview">
+                <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
+                  <path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z" />
+                </svg>
+              </HeaderButton>
+            </div>
+          </>
+        )}
+
+        {!chatLoaded && (
+          <div className="ml-auto">
+            <HeaderButton title="Source code" href="https://github.com/pranavkale07/whatsview">
+              <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
+                <path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z" />
+              </svg>
+            </HeaderButton>
+          </div>
+        )}
+      </header>
+
+      <main className="flex-1 overflow-hidden">
+        {!chatLoaded ? (
+          <div className="h-full overflow-y-auto">
+            <Uploader onFile={handleFile} isBusy={isBusy} error={error} onDismissError={() => setError(null)} />
+          </div>
+        ) : (
+          <ChatView
+            ref={chatViewRef}
+            messages={messages}
+            colorMap={colorMap}
+            me={me}
+            getBlob={getBlob}
+            onSelectAttachment={setSelectedAttachment}
+            highlight={query.trim()}
+            activeMatchIndex={matches[activeMatch]}
+          />
+        )}
+      </main>
+
       {selectedAttachment && (
-        <AttachmentViewer
-          attachment={selectedAttachment}
-          onClose={() => setSelectedAttachment(null)}
-        />
+        <AttachmentViewer attachment={selectedAttachment} getBlob={getBlob} onClose={() => setSelectedAttachment(null)} />
       )}
+      {showStats && <StatsPanel messages={messages} colorMap={colorMap} onClose={() => setShowStats(false)} />}
     </div>
   );
 }

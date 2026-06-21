@@ -5,46 +5,49 @@ import { saveAs } from 'file-saver';
  * Attachment Viewer Component
  * Handles display and interaction with different attachment types
  */
-function AttachmentViewer({ attachment, onClose }) {
+function AttachmentViewer({ attachment, getBlob, onClose }) {
   const [objectUrl, setObjectUrl] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState(null);
   const objectUrlRef = useRef(null);
+  const blobRef = useRef(null);
   const modalRef = useRef(null);
 
   useEffect(() => {
-    if (attachment && attachment.blob) {
-      try {
-        // Clean up previous URL if exists
-        if (objectUrlRef.current) {
-          URL.revokeObjectURL(objectUrlRef.current);
+    let active = true;
+    const isPdf = attachment.filename.toLowerCase().endsWith('.pdf');
+    setIsLoading(true);
+    setError(null);
+
+    getBlob(attachment.filename, isPdf ? 'application/pdf' : undefined)
+      .then((blob) => {
+        if (!active) return;
+        if (!blob) {
+          setError('Failed to load attachment');
+          setIsLoading(false);
+          return;
         }
-        
-        // Create a new blob with proper MIME type for PDFs
-        let blob = attachment.blob;
-        if (attachment.filename.toLowerCase().endsWith('.pdf')) {
-          blob = new Blob([attachment.blob], { type: 'application/pdf' });
-        }
-        
+        blobRef.current = blob;
         const url = URL.createObjectURL(blob);
         objectUrlRef.current = url;
         setObjectUrl(url);
         setIsLoading(false);
-      } catch (err) {
-        console.error('Error creating object URL:', err);
-        setError('Failed to load attachment');
-        setIsLoading(false);
-      }
-    }
+      })
+      .catch(() => {
+        if (active) {
+          setError('Failed to load attachment');
+          setIsLoading(false);
+        }
+      });
 
-    // Cleanup object URL on unmount
     return () => {
+      active = false;
       if (objectUrlRef.current) {
         URL.revokeObjectURL(objectUrlRef.current);
         objectUrlRef.current = null;
       }
     };
-  }, [attachment]);
+  }, [attachment, getBlob]);
 
   // Handle ESC key and background clicks
   useEffect(() => {
@@ -70,8 +73,8 @@ function AttachmentViewer({ attachment, onClose }) {
   }, [onClose]);
 
   const handleDownload = () => {
-    if (attachment.blob) {
-      saveAs(attachment.blob, attachment.filename);
+    if (blobRef.current) {
+      saveAs(blobRef.current, attachment.filename);
     }
   };
 
