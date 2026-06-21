@@ -1,136 +1,107 @@
 import JSZip from 'jszip';
 
 /**
- * Handles ZIP file upload and extraction
+ * Handles WhatsApp ZIP exports.
+ *
+ * Only the chat .txt is read up front. Media files stay compressed inside the
+ * archive and are extracted on demand (when a message scrolls into view), which
+ * keeps memory bounded even for large "with media" exports.
  */
 export class ZipHandler {
   constructor() {
     this.zip = null;
-    this.files = new Map();
+    this.entries = new Map(); // filename -> JSZip file object
   }
 
   /**
-   * Load and extract ZIP file
-   * @param {File} file - ZIP file to process
-   * @returns {Promise<Object>} - Extracted files and metadata
+   * Load a ZIP file, index its entries and read the chat text.
+   * @param {File} file
+   * @returns {Promise<{ chatText: string, chatFileName: string, fileNames: Set<string>, metadata: object }>}
    */
   async loadZipFile(file) {
+    if (!file.name.toLowerCase().endsWith('.zip')) {
+      throw new Error('Please upload a ZIP file');
+    }
+
+    const maxSize = 2 * 1024 * 1024 * 1024; // 2GB
+    if (file.size > maxSize) {
+      throw new Error('File too large. Maximum size is 2GB');
+    }
+
     try {
-      // Validate file type
-      if (!file.name.toLowerCase().endsWith('.zip')) {
-        throw new Error('Please upload a ZIP file');
-      }
-
-      // Validate file size (500MB limit)
-      const maxSize = 500 * 1024 * 1024; // 500MB
-      if (file.size > maxSize) {
-        throw new Error('File too large. Maximum size is 500MB');
-      }
-
-      // Load ZIP file
       this.zip = await JSZip.loadAsync(file);
-      
-      // Extract all files
-      await this.extractFiles();
-      
-      // Find chat file
-      const chatFile = this.findChatFile();
-      if (!chatFile) {
-        throw new Error('No chat file found. Please ensure your ZIP contains a WhatsApp chat export.');
-      }
+    } catch {
+      throw new Error('Could not read ZIP file. It may be corrupted.');
+    }
 
-      return {
-        chatFile,
-        files: this.files,
-        metadata: {
-          totalFiles: this.files.size,
-          zipSize: file.size,
-          chatFileName: chatFile.name
+    this.entries.clear();
+    for (const [name, entry] of Object.entries(this.zip.files)) {
+      if (!entry.dir) {
+        // WhatsApp exports are flat, but be safe and key by basename too.
+        this.entries.set(name, entry);
+        const base = name.split('/').pop();
+        if (base && base !== name && !this.entries.has(base)) {
+          this.entries.set(base, entry);
         }
-      };
-    } catch (error) {
-      throw new Error(`Failed to process ZIP file: ${error.message}`);
+      }
     }
-  }
 
-  /**
-   * Extract all files from ZIP to memory
-   * @private
-   */
-  async extractFiles() {
-    this.files.clear();
-    
-    // Process files in batches to avoid blocking the UI
-    const fileEntries = Object.entries(this.zip.files);
-    const batchSize = 10;
-    
-    for (let i = 0; i < fileEntries.length; i += batchSize) {
-      const batch = fileEntries.slice(i, i + batchSize);
-      
-      await Promise.all(
-        batch.map(async ([filename, zipFile]) => {
-          if (!zipFile.dir) {
-            try {
-              const blob = await zipFile.async('blob');
-              this.files.set(filename, blob);
-            } catch (error) {
-              console.warn(`Failed to extract file: ${filename}`, error);
-            }
-          }
-        })
+    const chatEntry = this.findChatEntry();
+    if (!chatEntry) {
+      throw new Error(
+        'No chat file found. Make sure the ZIP is a WhatsApp chat export (it should contain a .txt file).'
       );
-      
-      // Yield to browser for smooth UI
-      await new Promise(resolve => setTimeout(resolve, 0));
-    }
-  }
-
-  /**
-   * Find the main chat file in the extracted files
-   * @private
-   * @returns {Object|null} - Chat file info or null
-   */
-  findChatFile() {
-    const chatFiles = Array.from(this.files.keys()).filter(filename => {
-      const lowerName = filename.toLowerCase();
-      return lowerName.endsWith('.txt') && 
-             (lowerName.includes('chat') || lowerName.includes('whatsapp'));
-    });
-
-    if (chatFiles.length === 0) {
-      return null;
     }
 
-    // Return the first chat file found
-    const chatFileName = chatFiles[0];
+    const chatText = await chatEntry.async('string');
+
     return {
-      name: chatFileName,
-      blob: this.files.get(chatFileName)
+      chatText,
+      chatFileName: chatEntry.name,
+      fileNames: new Set(this.entries.keys()),
+      metadata: {
+        totalFiles: this.entries.size,
+        zipSize: file.size,
+        chatFileName: chatEntry.name,
+      },
     };
   }
 
-  /**
-   * Get file by filename
-   * @param {string} filename - Name of the file to retrieve
-   * @returns {Blob|null} - File blob or null if not found
-   */
-  getFile(filename) {
-    return this.files.get(filename) || null;
+  /** Find the main chat .txt entry. */
+  findChatEntry() {
+    const txtEntries = [...this.entries.entries()].filter(([name]) =>
+      name.toLowerCase().endsWith('.txt')
+    );
+    if (txtEntries.length === 0) return null;
+    // Prefer a file that looks like a WhatsApp chat export.
+    const preferred = txtEntries.find(([name]) => {
+      const n = name.toLowerCase();
+      return n.includes('chat') || n.includes('whatsapp');
+    });
+    return (preferred || txtEntries[0])[1];
+  }
+
+  /** Whether a file exists in the archive. */
+  hasFile(filename) {
+    return this.entries.has(filename);
   }
 
   /**
-   * Get all files
-   * @returns {Map} - Map of all extracted files
+   * Extract a single file as a Blob, on demand.
+   * @param {string} filename
+   * @param {string} [mimeType]
+   * @returns {Promise<Blob|null>}
    */
-  getAllFiles() {
-    return this.files;
+  async getBlob(filename, mimeType) {
+    const entry = this.entries.get(filename);
+    if (!entry) return null;
+    const data = await entry.async('blob');
+    return mimeType ? new Blob([data], { type: mimeType }) : data;
   }
 
-  /**
-   * Clean up resources
-   */
+  /** Release the archive. */
   cleanup() {
-    this.files.clear();
+    this.entries.clear();
     this.zip = null;
   }
 }

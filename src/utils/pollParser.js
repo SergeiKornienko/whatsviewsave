@@ -51,7 +51,7 @@ export function parsePollMessage(message) {
 
   // Extract options with vote counts
   const options = [];
-  const optionRegex = /(?:OPTION:|Option:|option:|\•|\✓|\☑)\s*(.+?)\s*\((\d+).*?\)/i;
+  const optionRegex = /(?:OPTION:|Option:|option:|•|✓|☑)\s*(.+?)\s*\((\d+).*?\)/i;
   
   for (let i = 1; i < lines.length; i++) {
     const line = lines[i];
