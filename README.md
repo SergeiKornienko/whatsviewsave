@@ -1,13 +1,12 @@
-# WhatsView
+# WhatsViewSave
 
-A fast, private viewer for **exported WhatsApp chats**. Drop in your exported `.zip`
+A fast, private viewer and saver for **exported WhatsApp chats**. Drop in your exported `.zip`
 and read your conversation back in a clean, WhatsApp-style interface — complete with
 images, videos, voice notes, documents, and stickers.
 
 **100% local.** Everything runs in your browser. Your chat never gets uploaded to a
 server — there are no servers, no accounts, and no tracking.
 
-🔗 **Live:** [whatsview.vercel.app](https://whatsview.vercel.app/)
 
 ## Features
 
