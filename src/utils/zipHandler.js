@@ -1,3 +1,4 @@
+// src/utils/zipHandler.js
 import JSZip from 'jszip';
 
 /**
@@ -10,6 +11,7 @@ import JSZip from 'jszip';
 export class ZipHandler {
   constructor() {
     this.zip = null;
+    this.zipData = null; // Сохраняем исходные данные
     this.entries = new Map(); // filename -> JSZip file object
   }
 
@@ -29,7 +31,9 @@ export class ZipHandler {
     }
 
     try {
-      this.zip = await JSZip.loadAsync(file);
+      // Сохраняем исходные данные для экспорта
+      this.zipData = await file.arrayBuffer();
+      this.zip = await JSZip.loadAsync(this.zipData);
     } catch {
       throw new Error('Could not read ZIP file. It may be corrupted.');
     }
@@ -99,9 +103,21 @@ export class ZipHandler {
     return mimeType ? new Blob([data], { type: mimeType }) : data;
   }
 
+  /**
+   * Возвращает исходные данные ZIP-архива
+   * @returns {Promise<ArrayBuffer>}
+   */
+  async getOriginalZipData() {
+    if (!this.zipData) {
+      throw new Error('ZIP-архив не загружен');
+    }
+    return this.zipData;
+  }
+
   /** Release the archive. */
   cleanup() {
     this.entries.clear();
     this.zip = null;
+    this.zipData = null;
   }
 }
